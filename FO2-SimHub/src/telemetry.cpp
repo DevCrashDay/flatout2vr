@@ -488,13 +488,10 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
     sprintf(g_logPath, "%s\\FO2Telemetry.log", g_dir);
     DeleteFileA(g_logPath);
 
-    char exe[MAX_PATH];
-    GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    WIN32_FILE_ATTRIBUTE_DATA fa;
-    if (!GetFileAttributesExA(exe, GetFileExInfoStandard, &fa) || fa.nFileSizeHigh || fa.nFileSizeLow != 5369344 ||
-        *(const BYTE*)0x46FA34 != 0xE8)
+    // v1.2 code check (the Steam/retail FlatOut2.exe and the unpacked FlatOut2_openspy.exe share it).
+    if (*(const BYTE*)0x46FA34 != 0xE8 || 0x46FA39 + *(const int*)0x46FA35 != 0x46FA50 || *(const DWORD*)0x67D610 != 0x5A7130)
     {
-        Log("unsupported FlatOut2.exe (needs v1.2, 5,369,344 bytes) - telemetry disabled");
+        Log("unsupported FlatOut2.exe (needs v1.2) - telemetry disabled");
         return TRUE;
     }
     // [INPUT] Enabled=0 leaves the game's controls alone (no wheel/pedal feed, no code patched).

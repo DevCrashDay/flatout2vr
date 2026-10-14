@@ -3217,6 +3217,17 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         Log("unsupported FlatOut2.exe (needs v1.2, 5,369,344 bytes) - mod disabled");
         return TRUE;
     }
+    {
+        // A 32-bit game without the large-address-aware flag gets only 2 GB, which DXVK + VR + many
+        // AI cars can use up; the game then crashes on a failed allocation (e.g. its replay buffers).
+        const BYTE* img = (const BYTE*)GetModuleHandleA(nullptr);
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(img + ((const IMAGE_DOS_HEADER*)img)->e_lfanew);
+        bool laa = (nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) != 0;
+        MEMORYSTATUSEX ms = { sizeof(ms) };
+        GlobalMemoryStatusEx(&ms);
+        Log("game memory: %s, %u MB address space%s", laa ? "large address aware" : "NOT large address aware",
+            (unsigned)(ms.ullTotalVirtual >> 20), laa ? "" : " - set the flag on the exe (4GB patch) or the game can run out of memory in races");
+    }
     Log("camera hook installed%s%s", g.CameraHook ? "" : " (cockpit camera off: [DEBUG] CameraHook=0)", g.FovHook ? "" : " (field of view untouched: [DEBUG] FieldOfView=0)");
     StartCrashLog();
     CreateThread(nullptr, 0, InputThread, nullptr, 0, nullptr);

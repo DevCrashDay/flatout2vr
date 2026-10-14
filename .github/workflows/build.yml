@@ -7,6 +7,8 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
@@ -36,3 +38,16 @@ jobs:
         with:
           name: FlatOut2-VR
           path: dist
+      # The newest build of each branch is also kept as plain files on the branch "build/<branch>",
+      # so it can be fetched with git (no artifact download needed).
+      - name: Publish build branch
+        if: github.event_name == 'push'
+        shell: pwsh
+        working-directory: dist
+        run: |
+          git init -q
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Build of ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/build/${{ github.ref_name }}"
