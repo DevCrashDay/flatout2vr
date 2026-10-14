@@ -39,13 +39,8 @@
 #include <cstring>
 #include <cstdarg>
 #include <string>
-#ifdef _MSC_VER
-#include <intrin.h>
-#pragma intrinsic(_ReturnAddress)
-#define RETURN_ADDRESS() _ReturnAddress()
-#else
+#ifndef _MSC_VER
 // MinGW build (compile check / non-MSVC toolchains): no SEH, guarded reads become plain reads.
-#define RETURN_ADDRESS() __builtin_return_address(0)
 #undef __try
 #undef __except
 #define __try if (true)
@@ -66,8 +61,7 @@
 // ---------------------------------------------------------------- game addresses
 static const DWORD kRenderCallSite = 0x479311;  // E8 -> 0x4C9DC0 (render all views)
 static const DWORD kRenderViews = 0x4C9DC0;
-static const DWORD kRenderViewsEnd = 0x4CBD10;   // end of that function (SetCamera/SetFrustum callers)
-static const DWORD kDeviceD3dVtbl = 0x67D560;    // DeviceD3d vtable
+static const DWORD kDeviceD3dVtbl = 0x67D560;    // DeviceD3d vtable (version check only)
 static const int kSlotSetFrustum = 0xB0 / 4;     // DeviceD3d::SetFrustum (0x5A7130)
 static IDirect3DDevice9** const kD3DDevice = (IDirect3DDevice9**)0x8DA788;
 static BYTE** const kGameFlow = (BYTE**)0x8E8410;  // +0x458 game state (2 = race), +0x9B8 player host
@@ -87,7 +81,7 @@ struct Settings
     int UseRoll = 1;
     int Overlay = 1;
     int OverlaySBS = 1;
-    float OverlayDistance = 1.0f;
+    float OverlayDistance = 2.0f;
     float OverlayWidth = 1.6f;
     float OverlayUp = 0.0f;
     int KeyToggle = VK_F7, KeyRecenter = VK_F8, KeySave = VK_F9, KeyOverlay = VK_F10;
@@ -98,6 +92,7 @@ struct Settings
     int Stereo = 1;                  // 1 = render left/right eye on alternating frames
     float IPD = 0.0f;                // meters, 0 = take it from the headset
     float PositionScaleStereo = 1.0f;
+    float NearestDepth = 0.5f;       // meters: depth stereo treats anything nearer as this far
     float GameFOV = 90.0f;           // horizontal field of view in degrees, 0 = leave the game's FOV
     int AutoWidth = 1;               // size the screen from GameFOV so the world has the right scale
     float WidthScale = 1.0f;
@@ -115,6 +110,9 @@ struct Settings
     float HudSpeedX = 0.60f, HudSpeedY = 0.72f;  // panel centers as fractions of the screen
     float HudInfoX = 0.50f, HudInfoY = 0.20f;
     int NoSpeedZoom = 1;             // keep the field of view fixed (the game zooms out with speed)
+    int CameraHook = 1;              // [DEBUG] 0 = never move the game camera (to find crashes)
+    int FovHook = 1;                 // [DEBUG] 0 = never change the game's field of view
+    int CrashLog = 1;                // [DEBUG] log crashes and game freezes with their code address
     int Gauges = 1;                  // round rev counter + speedometer fixed in the car
     float GaugeDistance = 0.62f, GaugeDown = 0.30f, GaugeRight = 0.0f, GaugeSpacing = 0.20f, GaugeSize = 0.075f;
     float GaugeMaxRpm = 9000, GaugeRedline = 7500, GaugeMaxSpeed = 320;
@@ -159,6 +157,7 @@ static void LoadSettings()
     g.Stereo = IniI("STEREO", "AlternateEyes", g.Stereo);
     g.IPD = IniF("STEREO", "IPD", g.IPD);
     g.PositionScaleStereo = IniF("STEREO", "DepthScale", g.PositionScaleStereo);
+    g.NearestDepth = IniF("STEREO", "NearestDepth", g.NearestDepth);
     g.GameFOV = IniF("STEREO", "GameFOV", g.GameFOV);
     g.AutoWidth = IniI("OVERLAY", "AutoWidth", g.AutoWidth);
     g.WidthScale = IniF("OVERLAY", "WidthScale", g.WidthScale);
@@ -178,6 +177,9 @@ static void LoadSettings()
     g.HudInfoY = IniF("HUD", "InfoY", g.HudInfoY);
     g.Gauges = IniI("GAUGES", "Enabled", g.Gauges);
     g.NoSpeedZoom = IniI("STEREO", "NoSpeedZoom", g.NoSpeedZoom);
+    g.CameraHook = IniI("DEBUG", "CameraHook", g.CameraHook);
+    g.FovHook = IniI("DEBUG", "FieldOfView", g.FovHook);
+    g.CrashLog = IniI("DEBUG", "CrashLog", g.CrashLog);
     g.GaugeDistance = IniF("GAUGES", "Distance", g.GaugeDistance);
     g.GaugeDown = IniF("GAUGES", "Down", g.GaugeDown);
     g.GaugeRight = IniF("GAUGES", "Right", g.GaugeRight);
@@ -398,6 +400,8 @@ static bool GetHmdPose(vr::HmdMatrix34_t& out)
 
 // Frame counter advanced at every Present; even frames are the left eye, odd frames the right eye.
 static volatile LONG g_frame = 0;
+static volatile DWORD g_lastPresentTick, g_presentThread;  // for the freeze watchdog
+static volatile LONG g_presents;
 // Raw seated-universe head pose used to render each frame, for anchoring the overlay.
 struct FramePose { vr::HmdMatrix34_t m; LONG frame; bool valid; };
 static FramePose g_framePose[64];
@@ -588,31 +592,16 @@ static float g_gameView[16], g_gameProj[16];
 static volatile LONG g_gameProjFrame = -100;
 static const float* GameProj() { return (g_frame - g_gameProjFrame) <= 2 ? g_gameProj : nullptr; }
 
-// DeviceD3d::SetFrustum (thiscall, frustum = l, r, b, t, near, far, ortho). Only calls coming from
-// the view render function are touched: with [STEREO] GameFOV set, the horizontal field of view
-// is replaced (the vertical one follows the aspect ratio).
-typedef void(__fastcall* SetFrustumFn)(void* self, void* edx, float* fr);
-static SetFrustumFn oSetFrustum;
-static volatile bool g_inRender;
-
-static void __fastcall HkSetFrustum(void* self, void* edx, float* fr)
+// Scales a frustum (l, r, b, t, near, far, ortho flag) to [STEREO] GameFOV horizontally; the
+// vertical field of view follows the aspect ratio.
+static bool ApplyGameFov(float* f)
 {
-    DWORD ret = (DWORD)RETURN_ADDRESS();
-    if (g_inRender && g.GameFOV > 0 && ret >= kRenderViews && ret < kRenderViewsEnd && fr && *(DWORD*)(fr + 6) == 0 && CockpitActive())
-    {
-        float f[7];
-        memcpy(f, fr, sizeof(f));
-        float halfW = 0.5f * (f[1] - f[0]);
-        float n = f[4];
-        if (halfW > 1e-6f && n > 1e-6f)
-        {
-            float k = n * tanf(g.GameFOV * 0.5f * 3.14159265f / 180.0f) / halfW;
-            for (int i = 0; i < 4; i++) f[i] *= k;
-            oSetFrustum(self, edx, f);
-            return;
-        }
-    }
-    oSetFrustum(self, edx, fr);
+    if (g.GameFOV <= 0 || *(DWORD*)(f + 6) != 0) return false;
+    float halfW = 0.5f * (f[1] - f[0]), n = f[4];
+    if (!(halfW > 1e-6f && n > 1e-6f && halfW < 100 * n)) return false;
+    float k = n * tanf(g.GameFOV * 0.5f * 3.14159265f / 180.0f) / halfW;
+    for (int i = 0; i < 4; i++) f[i] *= k;
+    return true;
 }
 
 static void ResolveDepth(IDirect3DDevice9* dev);
@@ -620,22 +609,25 @@ static bool InitDepthStereo(IDirect3DDevice9* dev);
 static volatile bool g_hooksReady;  // device hooks (incl. depth-stencil get/set) installed
 
 // The game's "render all views" call (0x479311 -> 0x4C9DC0, stdcall). cams[i] + 0x80 is the
-// camera matrix of view i, fovScale[i] the game's speed zoom factor for it.
+// camera matrix of view i, cams[i] + 0xF0 its frustum (passed to DeviceD3d::SetFrustum by the
+// render function), fovScale[i] the game's speed zoom factor for it.
 typedef void(__stdcall* RenderViewsFn)(BYTE* ctx, BYTE** cams, float* fovScale);
 static void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
 {
-    float saved[16];
+    float saved[16], savedFr[7];
     float* camM = nullptr;
+    float* camFr = nullptr;
+    bool cockpit = g.CameraHook && CockpitActive();
     __try
     {
         int views = ctx ? *(int*)(ctx + 0x1BC) : 0;
-        if (views == 1 && cams && cams[0]) camM = (float*)(cams[0] + 0x80);
-        if (camM && g.NoSpeedZoom && CockpitActive() && fovScale) fovScale[0] = 1.0f;
+        if (views == 1 && cams && cams[0]) { camM = (float*)(cams[0] + 0x80); camFr = (float*)(cams[0] + 0xF0); }
+        if (camM && cockpit && g.FovHook && g.NoSpeedZoom && fovScale) fovScale[0] = 1.0f;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) { camM = nullptr; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { camM = camFr = nullptr; }
 
-    bool swapped = false;
-    if (camM && CockpitActive())
+    bool swapped = false, fovSet = false;
+    if (camM && cockpit)
     {
         float M[16];
         if (BuildCockpitView(M, true, g.GameFOV > 0 ? g.GameFOV : 90.0f))
@@ -647,11 +639,23 @@ static void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
             static bool logged;
             if (!logged) { logged = true; Log("cockpit camera active (camera matrix %p)", camM); }
         }
+        if (g.FovHook)
+        {
+            float f[7];
+            memcpy(savedFr, camFr, sizeof(savedFr));
+            memcpy(f, camFr, sizeof(f));
+            if (ApplyGameFov(f))
+            {
+                memcpy(camFr, f, sizeof(f));
+                fovSet = true;
+                static bool logged;
+                if (!logged) { logged = true; Log("field of view %.0f degrees (game frustum %.3f %.3f near %.3f)", g.GameFOV, savedFr[0], savedFr[1], savedFr[4]); }
+            }
+        }
     }
-    g_inRender = true;
     ((RenderViewsFn)kRenderViews)(ctx, cams, fovScale);
-    g_inRender = false;
     if (swapped) memcpy(camM, saved, sizeof(saved));
+    if (fovSet) memcpy(camFr, savedFr, sizeof(savedFr));
 
     // The renderer's view and projection of the 3D scene, for the gauges and the depth stereo.
     memcpy(g_gameView, kView, sizeof(g_gameView));
@@ -1535,7 +1539,7 @@ static void DrawDepthStereo(IDirect3DDevice9* dev)
     float P0 = 0.66f, P22 = 1.0f, P32 = -0.5f;
     if (const float* P = GameProj()) { P0 = P[0]; P22 = P[10]; P32 = P[14]; }
     float shift = 0.5f * (g.IPD > 0 ? g.IPD : g_ipd) * g.PositionScaleStereo;
-    float nearZ = 0.30f;  // nearest surfaces in the cabin are a bit further than this
+    float nearZ = g.NearestDepth > 0.05f ? g.NearestDepth : 0.05f;  // nearer surfaces get this depth (no 3D pop right at the eyes)
     float maxDisp = 0.5f * P0 * shift / nearZ;
     float c0[4] = { P0, P22, P32, shift };
     float c1[4] = { (float)g.DepthSteps, maxDisp, 1.0f / sd.Width, nearZ };
@@ -1904,7 +1908,9 @@ static HRESULT STDMETHODCALLTYPE HkPresent(IDirect3DDevice9* dev, const RECT* a,
 {
     LONG f = g_frame;
     static int logged;
-    if (!logged) { logged = 1; Log("first Present through hook"); }
+    if (!logged) { logged = 1; Log("first Present through hook"); g_presentThread = GetCurrentThreadId(); }
+    g_lastPresentTick = GetTickCount();
+    InterlockedIncrement(&g_presents);
     {
         static DWORD t0 = GetTickCount(); static int n, reports;
         n++;
@@ -3053,15 +3059,124 @@ static bool PatchCall(DWORD site, void* fn, DWORD expectTarget)
     return true;
 }
 
-static bool PatchPointer(DWORD addr, void* fn, void** orig)
+// ---------------------------------------------------------------- crash and freeze log
+// A crash writes the exception, the code address as module+offset, the registers and the return
+// addresses found on the stack to the log. If the game stops presenting frames for a few seconds,
+// the watchdog samples where the game thread is stuck and logs the same.
+static void ModuleOffset(DWORD a, char* out, size_t n)
 {
-    void** p = (void**)addr;
-    DWORD old;
-    if (!VirtualProtect(p, sizeof(void*), PAGE_READWRITE, &old)) return false;
-    *orig = *p;
-    *p = fn;
-    VirtualProtect(p, sizeof(void*), old, &old);
-    return true;
+    HMODULE m = nullptr;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m)
+    {
+        GetModuleFileNameA(m, path, MAX_PATH);
+        const char* name = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+        snprintf(out, n, "%08lX %s+0x%lX", a, name, a - (DWORD)m);
+    }
+    else snprintf(out, n, "%08lX", a);
+}
+
+static bool IsCode(DWORD a)
+{
+    MEMORY_BASIC_INFORMATION mi;
+    if (a < 0x10000 || !VirtualQuery((void*)a, &mi, sizeof(mi)) || mi.State != MEM_COMMIT) return false;
+    return (mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+// Logs registers and up to 12 likely return addresses from a copy of the stack.
+static void LogContext(const char* what, DWORD eip, const CONTEXT& c, const DWORD* stack, int words)
+{
+    char where[200];
+    ModuleOffset(eip, where, sizeof(where));
+    Log("%s at %s", what, where);
+    Log("  eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX ebp=%08lX esp=%08lX",
+        c.Eax, c.Ebx, c.Ecx, c.Edx, c.Esi, c.Edi, c.Ebp, c.Esp);
+    int found = 0;
+    for (int i = 0; i < words && found < 12; i++)
+    {
+        if (!IsCode(stack[i])) continue;
+        ModuleOffset(stack[i], where, sizeof(where));
+        Log("  stack+%03X: %s", i * 4, where);
+        found++;
+    }
+}
+
+static int CopyStack(DWORD esp, DWORD* out, int words)
+{
+    int n = 0;
+    __try { for (; n < words; n++) out[n] = ((const DWORD*)esp)[n]; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return n;
+}
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter;
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
+{
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1) == 0)
+    {
+        const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+        if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+            Log("CRASH: exception %08lX (%s address %08lX) in thread %lu%s", er->ExceptionCode,
+                er->ExceptionInformation[0] == 8 ? "execute" : er->ExceptionInformation[0] ? "write" : "read",
+                (DWORD)er->ExceptionInformation[1], GetCurrentThreadId(), GetCurrentThreadId() == g_presentThread ? " (game thread)" : "");
+        else
+            Log("CRASH: exception %08lX in thread %lu%s", er->ExceptionCode, GetCurrentThreadId(),
+                GetCurrentThreadId() == g_presentThread ? " (game thread)" : "");
+        static DWORD stack[256];
+        int n = CopyStack(ep->ContextRecord->Esp, stack, 256);
+        LogContext("  code", (DWORD)er->ExceptionAddress, *ep->ContextRecord, stack, n);
+    }
+    return g_prevFilter ? g_prevFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static DWORD WINAPI WatchdogThread(LPVOID)
+{
+    int stalls = 0;
+    DWORD stallLogged = 0;  // g_lastPresentTick of the stall already reported
+    for (;;)
+    {
+        Sleep(500);
+        // The game may install its own crash handler after us; keep ours first and chain to it.
+        LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(CrashFilter);
+        if (prev && prev != CrashFilter) g_prevFilter = prev;
+
+        DWORD last = g_lastPresentTick, now = GetTickCount();
+        if (!g_presentThread || g_presents < 300 || now - last < 4000) continue;
+        if (stallLogged == last || stalls >= 3) continue;
+        stallLogged = last;
+        stalls++;
+        // Sample the game thread a few times. Nothing that can take a lock (logging, module lookup)
+        // runs while it is suspended.
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, g_presentThread);
+        if (!t) { Log("FREEZE: game stopped presenting frames %.1f s ago (thread not readable)", (now - last) / 1000.0f); continue; }
+        Log("FREEZE: game stopped presenting frames %.1f s ago (in race: %s). Where the game thread is:",
+            (now - last) / 1000.0f, InRace() ? "yes" : "no");
+        for (int k = 0; k < 3; k++)
+        {
+            static DWORD stack[256];
+            CONTEXT c = {};
+            c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            int n = 0;
+            bool ok = false;
+            if (SuspendThread(t) != (DWORD)-1)
+            {
+                ok = GetThreadContext(t, &c) != 0;
+                if (ok) n = CopyStack(c.Esp, stack, 256);
+                ResumeThread(t);
+            }
+            if (ok) LogContext(k == 0 ? "  sample 1" : k == 1 ? "  sample 2" : "  sample 3", c.Eip, c, stack, n);
+            Sleep(300);
+        }
+        CloseHandle(t);
+    }
+}
+
+static void StartCrashLog()
+{
+    if (!g.CrashLog) return;
+    g_prevFilter = SetUnhandledExceptionFilter(CrashFilter);
+    CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
 }
 
 BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
@@ -3102,8 +3217,8 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         Log("unsupported FlatOut2.exe (needs v1.2, 5,369,344 bytes) - mod disabled");
         return TRUE;
     }
-    Log("camera hook installed");
-    if (PatchPointer(kDeviceD3dVtbl + 4 * kSlotSetFrustum, (void*)HkSetFrustum, (void**)&oSetFrustum)) Log("field of view hook installed");
+    Log("camera hook installed%s%s", g.CameraHook ? "" : " (cockpit camera off: [DEBUG] CameraHook=0)", g.FovHook ? "" : " (field of view untouched: [DEBUG] FieldOfView=0)");
+    StartCrashLog();
     CreateThread(nullptr, 0, InputThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, VRThread, nullptr, 0, nullptr);
     return TRUE;

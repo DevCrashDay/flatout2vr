@@ -457,7 +457,11 @@ static DWORD WINAPI SendThread(LPVOID)
 typedef void(__stdcall* ApplyControlsFn)(BYTE* player, int arg);
 static void __stdcall ApplyControlsHook(BYTE* player, int arg)
 {
-    if (player && player == LocalPlayer()) FfbApplyInput(player);
+    __try
+    {
+        if (player && player == LocalPlayer()) FfbApplyInput(player);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
     ((ApplyControlsFn)0x46FA50)(player, arg);
 }
 
@@ -488,10 +492,16 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (!GetFileAttributesExA(exe, GetFileExInfoStandard, &fa) || fa.nFileSizeHigh || fa.nFileSizeLow != 5369344 ||
-        !PatchCall(0x46FA34, (void*)ApplyControlsHook, 0x46FA50))
+        *(const BYTE*)0x46FA34 != 0xE8)
     {
         Log("unsupported FlatOut2.exe (needs v1.2, 5,369,344 bytes) - telemetry disabled");
         return TRUE;
+    }
+    // [INPUT] Enabled=0 leaves the game's controls alone (no wheel/pedal feed, no code patched).
+    if (GetPrivateProfileIntA("INPUT", "Enabled", 1, g_iniPath))
+    {
+        if (PatchCall(0x46FA34, (void*)ApplyControlsHook, 0x46FA50)) Log("input hook installed");
+        else Log("input hook: unexpected code at 0x46FA34 - wheel/pedal input disabled");
     }
     LoadSignatures();
     FfbStart(g_iniPath);

@@ -61,7 +61,15 @@ Smoothness
 Tuning
 - If the world seems to slide when you turn your head, use Ctrl+Shift+Up/Down until it stays still, then F9.
 - Wider or narrower view: GameFOV in [STEREO]; the screen grows with it.
-- 3D too strong or too weak: DepthScale in [STEREO].
+- 3D too strong or too weak: DepthScale in [STEREO]. If the car body feels right in front of your eyes,
+  raise NearestDepth or move the seat (and use the bumper camera so the body is not drawn).
+- Menu screen too close or too big: Ctrl+Shift+Left/Right and Ctrl+Shift+Up/Down, or Distance/Width in [OVERLAY].
 - Without a headset the mod only applies the seat position (you can still drive from the cockpit on the monitor).
+
+If the game crashes or freezes
+- scripts\FO2HeadTrack.log then ends with a CRASH or FREEZE block that says where in the game it happened.
+  Please send that log together with scripts\FO2Telemetry.log.
+- [DEBUG] in the ini switches parts of the mod off one at a time (CameraHook, FieldOfView), and
+  [INPUT] Enabled=0 in FO2Telemetry.ini leaves the game's controls alone, to find the culprit.
 
 Undo: delete scripts\FO2HeadTrack.asi and scripts\FO2HeadTrack.ini.

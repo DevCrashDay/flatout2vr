@@ -85,7 +85,8 @@ If SimHub lists FlatOut 2 but shows no data:
   player camera's matrix (`camera + 0x80`, rows right/up/forward/position) is replaced by car body
   (`Car + 0x1B0`) + seat offset + head pose and restored afterwards, so the renderer's view, culling and
   LOD follow your head while the game's own camera logic is untouched.
-- Field of view: `DeviceD3d::SetFrustum` (vtable `0x67D560`, slot `0xB0`), only for calls from that render function.
+- Field of view: the same camera's frustum (`camera + 0xF0`, which the render function passes to
+  `DeviceD3d::SetFrustum`) is scaled to `GameFOV` for the render and restored afterwards.
 - Input: `Player::ApplyControls` (`0x46FA50`, called at `0x46FA34`), with steering, throttle, brake and
   handbrake at `Player + 0x684 .. 0x690`.
 - Data: engine rpm `Car + 0x5D8`, gear `Car + 0x634`, velocity `Car + 0x280`, pedals `Car + 0x1DF4 ..`,
@@ -101,6 +102,8 @@ FlatOut 2 addresses come from reverse engineering `FlatOut2.exe` v1.2; the least
 - race position and lap numbering (0- or 1-based is detected at runtime).
 
 The logs (`scripts\FO2HeadTrack.log`, `scripts\FO2Telemetry.log`) say which hooks were installed.
+If the game crashes or stops drawing, `FO2HeadTrack.log` records where (code address, registers, stack).
+`[DEBUG]` in `FO2HeadTrack.ini` and `[INPUT] Enabled` in `FO2Telemetry.ini` switch single hooks off.
 The UG2 version's minimap-on-the-dashboard instrument is not ported.
 
 ## Credits
