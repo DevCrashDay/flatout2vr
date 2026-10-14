@@ -116,6 +116,11 @@ struct Settings
     int Gauges = 1;                  // round rev counter + speedometer fixed in the car
     float GaugeDistance = 0.62f, GaugeDown = 0.30f, GaugeRight = 0.0f, GaugeSpacing = 0.20f, GaugeSize = 0.075f;
     float GaugeMaxRpm = 9000, GaugeRedline = 7500, GaugeMaxSpeed = 320;
+    int Lift = 1;                    // move the game's own map and speedometer/nitro gauge onto the dashboard
+    float LiftMap[4] = { 0.00f, 0.35f, 0.26f, 1.00f };    // screen area of the game's map (x0, y0, x1, y1, 0..1)
+    float LiftBoost[4] = { 0.72f, 0.55f, 1.00f, 1.00f };  // screen area of the game's speedometer + nitro
+    float LiftScale = 1.0f;          // height of the lifted instruments relative to a gauge
+    int LiftSave = 1;                // save one race frame as FO2HeadTrack_hud.png (to set the areas)
 } g;
 
 static char g_iniPath[MAX_PATH];
@@ -188,6 +193,20 @@ static void LoadSettings()
     g.GaugeMaxRpm = IniF("GAUGES", "MaxRpm", g.GaugeMaxRpm);
     g.GaugeRedline = IniF("GAUGES", "Redline", g.GaugeRedline);
     g.GaugeMaxSpeed = IniF("GAUGES", "MaxSpeed", g.GaugeMaxSpeed);
+    g.Lift = IniI("HUDLIFT", "Enabled", g.Lift);
+    auto rect = [](const char* key, float* r)
+    {
+        char buf[128], d[128];
+        sprintf(d, "%.3f,%.3f,%.3f,%.3f", r[0], r[1], r[2], r[3]);
+        GetPrivateProfileStringA("HUDLIFT", key, d, buf, sizeof(buf), g_iniPath);
+        float t[4];
+        if (sscanf(buf, "%f,%f,%f,%f", &t[0], &t[1], &t[2], &t[3]) == 4 && t[2] > t[0] && t[3] > t[1])
+            for (int i = 0; i < 4; i++) r[i] = std::min(1.0f, std::max(0.0f, t[i]));
+    };
+    rect("MapArea", g.LiftMap);
+    rect("BoostArea", g.LiftBoost);
+    g.LiftScale = IniF("HUDLIFT", "Scale", g.LiftScale);
+    g.LiftSave = IniI("HUDLIFT", "SaveScreenshot", g.LiftSave);
     g.SeatRight = IniF("SEAT", "Right", g.SeatRight);
     g.SeatUp = IniF("SEAT", "Up", g.SeatUp);
     g.SeatForward = IniF("SEAT", "Forward", g.SeatForward);
@@ -606,6 +625,7 @@ static bool ApplyGameFov(float* f)
 
 static void ResolveDepth(IDirect3DDevice9* dev);
 static bool InitDepthStereo(IDirect3DDevice9* dev);
+static void LiftGrabScene(IDirect3DDevice9* dev);
 static volatile bool g_hooksReady;  // device hooks (incl. depth-stencil get/set) installed
 
 // The game's "render all views" call (0x479311 -> 0x4C9DC0, stdcall). cams[i] + 0x80 is the
@@ -665,6 +685,7 @@ static void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
 
     IDirect3DDevice9* dev = *kD3DDevice;
     if (dev && g_hooksReady && InRace() && g.StereoMode == 1 && g_vrReady && g.Overlay && InitDepthStereo(dev)) ResolveDepth(dev);
+    if (dev && g_hooksReady && swapped) LiftGrabScene(dev);
 }
 
 // ---------------------------------------------------------------- cursor
@@ -1175,6 +1196,256 @@ static void DrawRacePanel(const HudData& d, float cx, float cy, float k)
     Text(x, py + pad + th * 0.2f, th * 0.8f, c, dim);
 }
 
+// ---------------------------------------------------------------- HUD lift
+// The game's own map and speedometer/nitro gauge are moved from the screen onto the dashboard.
+// Right after the 3D views are rendered (before the game draws its HUD) the frame is copied (A,
+// scene only); at Present the finished frame is copied again (B, scene + HUD). A shader keeps
+// the pixels where B differs from A (the HUD) as a transparent overlay texture, which is drawn
+// as two instruments in the car, and A is put back over those screen areas.
+static struct
+{
+    IDirect3DTexture9 *scene, *full, *hud;
+    IDirect3DPixelShader9* ps;
+    IDirect3DDevice9* dev;
+    UINT w, h;
+    D3DFORMAT fmt;
+    volatile LONG frame = -100;   // frame whose clean scene is in `scene`
+    volatile LONG ready = -100;   // frame whose HUD overlay is in `hud`
+    bool failed, saved;
+    DWORD raceStart;
+} g_lift;
+
+static void ReleaseLift()
+{
+    if (g_lift.scene) { g_lift.scene->Release(); g_lift.scene = nullptr; }
+    if (g_lift.full) { g_lift.full->Release(); g_lift.full = nullptr; }
+    if (g_lift.hud) { g_lift.hud->Release(); g_lift.hud = nullptr; }
+    g_lift.w = g_lift.h = 0;
+    g_lift.frame = g_lift.ready = -100;
+}
+
+static bool LiftReady() { return g.Lift && g_lift.hud && g_lift.ready == g_frame; }
+
+static const char* kLiftHlsl =
+    "sampler2D sceneTex : register(s0);\n"
+    "sampler2D fullTex : register(s1);\n"
+    "float4 ps(float2 uv : TEXCOORD0) : COLOR {\n"
+    "  float3 a = tex2D(sceneTex, uv).rgb, b = tex2D(fullTex, uv).rgb;\n"
+    "  float3 d = abs(b - a);\n"
+    "  float k = saturate(max(d.r, max(d.g, d.b)) * 5.0);\n"
+    "  return float4(b, k);\n"
+    "}\n";
+
+static bool LiftWanted()
+{
+    return g.Lift && g.Gauges && g.Hud && g.Cockpit && CockpitActive() && InRace() && (g_frame - g_view.frame) <= 2;
+}
+
+// Called right after the game rendered its 3D views: keep a copy of the clean scene.
+static void LiftGrabScene(IDirect3DDevice9* dev)
+{
+    if (g_lift.failed || !LiftWanted()) return;
+    IDirect3DSurface9 *rt = nullptr, *bb = nullptr, *a = nullptr;
+    if (FAILED(dev->GetRenderTarget(0, &rt)) || !rt) return;
+    if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb)
+    {
+        if (rt != bb)
+        {
+            static bool logged;
+            if (!logged) { logged = true; Log("HUD lift: the scene is not drawn into the back buffer - map/nitro stay on the screen"); }
+        }
+        else
+        {
+            D3DSURFACE_DESC sd; bb->GetDesc(&sd);
+            if (g_lift.dev != dev || g_lift.w != sd.Width || g_lift.h != sd.Height || g_lift.fmt != sd.Format || !g_lift.scene)
+            {
+                ReleaseLift();
+                if (g_lift.ps && g_lift.dev != dev) { g_lift.ps->Release(); g_lift.ps = nullptr; }
+                g_lift.dev = dev;
+                if (FAILED(dev->CreateTexture(sd.Width, sd.Height, 1, D3DUSAGE_RENDERTARGET, sd.Format, D3DPOOL_DEFAULT, &g_lift.scene, nullptr)) ||
+                    FAILED(dev->CreateTexture(sd.Width, sd.Height, 1, D3DUSAGE_RENDERTARGET, sd.Format, D3DPOOL_DEFAULT, &g_lift.full, nullptr)) ||
+                    FAILED(dev->CreateTexture(sd.Width, sd.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_lift.hud, nullptr)))
+                {
+                    ReleaseLift();
+                    g_lift.failed = true;
+                    Log("HUD lift: could not create textures");
+                }
+                else
+                {
+                    g_lift.w = sd.Width; g_lift.h = sd.Height; g_lift.fmt = sd.Format;
+                    Log("HUD lift: map area %.2f %.2f - %.2f %.2f, speedometer area %.2f %.2f - %.2f %.2f (frame %ux%u)",
+                        g.LiftMap[0], g.LiftMap[1], g.LiftMap[2], g.LiftMap[3], g.LiftBoost[0], g.LiftBoost[1], g.LiftBoost[2], g.LiftBoost[3], sd.Width, sd.Height);
+                }
+            }
+            if (!g_lift.ps && !g_lift.failed)
+            {
+                ID3DBlob *pb = nullptr, *err = nullptr;
+                if (SUCCEEDED(D3DCompile(kLiftHlsl, strlen(kLiftHlsl), "lift", nullptr, nullptr, "ps", "ps_2_0", 0, 0, &pb, &err)) && pb)
+                    dev->CreatePixelShader((const DWORD*)pb->GetBufferPointer(), &g_lift.ps);
+                if (!g_lift.ps) { g_lift.failed = true; Log("HUD lift: shader failed %s", err ? (const char*)err->GetBufferPointer() : ""); }
+                if (pb) pb->Release();
+                if (err) err->Release();
+            }
+            if (g_lift.scene && SUCCEEDED(g_lift.scene->GetSurfaceLevel(0, &a)) && SUCCEEDED(dev->StretchRect(bb, nullptr, a, nullptr, D3DTEXF_NONE)))
+                g_lift.frame = g_frame;
+            if (a) a->Release();
+        }
+        bb->Release();
+    }
+    rt->Release();
+}
+
+// Writes the frame with the game's HUD to scripts\FO2HeadTrack_hud.png (once), so the map and
+// speedometer areas can be set from it. Encoding runs on its own thread.
+struct LiftShot { UINT w, h; std::vector<BYTE> px; };
+static DWORD WINAPI SaveShotThread(LPVOID p)
+{
+    LiftShot* s = (LiftShot*)p;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    char path[MAX_PATH];
+    strcpy(path, g_iniPath);
+    if (char* dot = strrchr(path, '.')) strcpy(dot, "_hud.png");
+    wchar_t wpath[MAX_PATH];
+    MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+    IWICImagingFactory* fac = nullptr;
+    IWICStream* st = nullptr;
+    IWICBitmapEncoder* enc = nullptr;
+    IWICBitmapFrameEncode* frm = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))) &&
+        SUCCEEDED(fac->CreateStream(&st)) && SUCCEEDED(st->InitializeFromFilename(wpath, GENERIC_WRITE)) &&
+        SUCCEEDED(fac->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) && SUCCEEDED(enc->Initialize(st, WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(enc->CreateNewFrame(&frm, nullptr)) && SUCCEEDED(frm->Initialize(nullptr)) && SUCCEEDED(frm->SetSize(s->w, s->h)))
+    {
+        WICPixelFormatGUID f = GUID_WICPixelFormat32bppBGR;
+        ok = SUCCEEDED(frm->SetPixelFormat(&f)) && SUCCEEDED(frm->WritePixels(s->h, s->w * 4, (UINT)s->px.size(), s->px.data())) &&
+             SUCCEEDED(frm->Commit()) && SUCCEEDED(enc->Commit());
+    }
+    if (frm) frm->Release();
+    if (enc) enc->Release();
+    if (st) st->Release();
+    if (fac) fac->Release();
+    Log(ok ? "HUD lift: saved a race frame with the game's HUD to %s" : "HUD lift: could not save %s", path);
+    delete s;
+    return 0;
+}
+
+static void LiftSaveShot(IDirect3DDevice9* dev)
+{
+    if (g_lift.fmt != D3DFMT_X8R8G8B8 && g_lift.fmt != D3DFMT_A8R8G8B8) return;
+    IDirect3DSurface9 *src = nullptr, *mem = nullptr;
+    if (SUCCEEDED(g_lift.full->GetSurfaceLevel(0, &src)) &&
+        SUCCEEDED(dev->CreateOffscreenPlainSurface(g_lift.w, g_lift.h, g_lift.fmt, D3DPOOL_SYSTEMMEM, &mem, nullptr)) &&
+        SUCCEEDED(dev->GetRenderTargetData(src, mem)))
+    {
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(mem->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
+        {
+            LiftShot* s = new LiftShot{ g_lift.w, g_lift.h, {} };
+            s->px.resize((size_t)s->w * s->h * 4);
+            for (UINT y = 0; y < s->h; y++) memcpy(&s->px[(size_t)y * s->w * 4], (BYTE*)lr.pBits + (size_t)y * lr.Pitch, s->w * 4);
+            mem->UnlockRect();
+            CreateThread(nullptr, 0, SaveShotThread, s, 0, nullptr);
+        }
+    }
+    if (mem) mem->Release();
+    if (src) src->Release();
+}
+
+// At Present, before the gauges are drawn: build the HUD overlay and remove the map and
+// speedometer from the screen picture.
+static void LiftAtPresent(IDirect3DDevice9* dev)
+{
+    if (g_lift.frame != g_frame || !g_lift.ps || !g_lift.hud || !LiftWanted()) return;
+    IDirect3DSurface9 *bb = nullptr, *b = nullptr, *h = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+    bool ok = SUCCEEDED(g_lift.full->GetSurfaceLevel(0, &b)) && SUCCEEDED(dev->StretchRect(bb, nullptr, b, nullptr, D3DTEXF_NONE)) &&
+              SUCCEEDED(g_lift.hud->GetSurfaceLevel(0, &h));
+    IDirect3DStateBlock9* sb = nullptr;
+    if (ok && SUCCEEDED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) && sb)
+    {
+        sb->Capture();
+        IDirect3DSurface9* oldRT = nullptr;
+        dev->GetRenderTarget(0, &oldRT);
+        float W = (float)g_lift.w, H = (float)g_lift.h;
+        struct V { float x, y, z, rhw, u, v; };
+        auto quad = [&](const float* r)
+        {
+            float x0 = r[0] * W - 0.5f, y0 = r[1] * H - 0.5f, x1 = r[2] * W - 0.5f, y1 = r[3] * H - 0.5f;
+            V q[4] = { { x0, y0, 0, 1, r[0], r[1] }, { x1, y0, 0, 1, r[2], r[1] }, { x0, y1, 0, 1, r[0], r[3] }, { x1, y1, 0, 1, r[2], r[3] } };
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+        };
+        dev->BeginScene();
+        dev->SetVertexShader(nullptr);
+        dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+        dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+        dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+        dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+        dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+        dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        for (int s = 0; s < 2; s++)
+        {
+            dev->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+            dev->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+            dev->SetSamplerState(s, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+            dev->SetSamplerState(s, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            dev->SetSamplerState(s, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            dev->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
+        }
+        // HUD overlay: the HUD pixels of both areas, transparent elsewhere.
+        D3DVIEWPORT9 vp = { 0, 0, g_lift.w, g_lift.h, 0.0f, 1.0f };
+        dev->SetRenderTarget(0, h);
+        dev->SetViewport(&vp);
+        dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
+        dev->SetPixelShader(g_lift.ps);
+        dev->SetTexture(0, g_lift.scene);
+        dev->SetTexture(1, g_lift.full);
+        quad(g.LiftMap);
+        quad(g.LiftBoost);
+        // Screen picture: the clean scene back over both areas.
+        dev->SetPixelShader(nullptr);
+        dev->SetTexture(1, nullptr);
+        dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+        dev->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        dev->SetRenderTarget(0, bb);
+        dev->SetViewport(&vp);
+        dev->SetTexture(0, g_lift.scene);
+        quad(g.LiftMap);
+        quad(g.LiftBoost);
+        dev->SetTexture(0, nullptr);
+        dev->EndScene();
+        if (oldRT) { dev->SetRenderTarget(0, oldRT); oldRT->Release(); }
+        sb->Apply();
+        sb->Release();
+        g_lift.ready = g_frame;
+        static bool logged;
+        if (!logged) { logged = true; Log("HUD lift active: map and speedometer moved to the dashboard"); }
+
+        if (!g_lift.raceStart) g_lift.raceStart = GetTickCount();
+        if (g.LiftSave && !g_lift.saved && GetTickCount() - g_lift.raceStart > 15000)
+        {
+            g_lift.saved = true;
+            LiftSaveShot(dev);
+        }
+    }
+    if (h) h->Release();
+    if (b) b->Release();
+    bb->Release();
+}
+
 static void DrawGauges(IDirect3DDevice9* dev, const HudData& d, float W, float H)
 {
     if (!g_stylesLoaded) return;
@@ -1199,12 +1470,21 @@ static void DrawGauges(IDirect3DDevice9* dev, const HudData& d, float W, float H
 
     float s = g.GaugeSize / 100.0f;
     // Left to right: rev counter, speedometer; the race bar sits above the middle.
-    for (int k = 0; k < 4; k++)
+    // Slots 4 and 5: the game's own map (left of the rev counter) and speedometer/nitro gauge
+    // (right of the speedometer), lifted out of the screen picture.
+    bool lift = LiftReady();
+    for (int k = 0; k < 6; k++)
     {
         if (k == 2) continue;  // slot of the UG2 version's minimap instrument (not ported)
         if (k == 3 && d.racers <= 0) continue;
+        if (k >= 4 && !lift) continue;
+        const float* area = k == 4 ? g.LiftMap : g.LiftBoost;
+        float halfH = g.GaugeSize * g.LiftScale, halfW = 0;
+        if (k >= 4) halfW = halfH * ((area[2] - area[0]) * W) / std::max(1.0f, (area[3] - area[1]) * H);
         float side, down = g.GaugeDown;
         side = g.GaugeRight + (k == 3 ? 0.0f : (k == 0 ? -0.5f : 0.5f) * g.GaugeSpacing);
+        if (k == 4) side = g.GaugeRight - 0.5f * g.GaugeSpacing - g.GaugeSize - 0.015f - halfW;
+        if (k == 5) side = g.GaugeRight + 0.5f * g.GaugeSpacing + g.GaugeSize + 0.015f + halfW;
         if (k == 3) down -= g.GaugeSize * 1.55f;
         float c[3], n[3], u[3], dv[3];
         for (int i = 0; i < 3; i++)
@@ -1218,7 +1498,8 @@ static void DrawGauges(IDirect3DDevice9* dev, const HudData& d, float W, float H
         for (int i = 0; i < 3; i++) { u[i] = v.right[i] - n[i] * rn; len += u[i] * u[i]; }
         len = sqrtf(len);
         for (int i = 0; i < 3; i++) u[i] /= len;
-        dv[0] = u[1] * n[2] - u[2] * n[1]; dv[1] = u[2] * n[0] - u[0] * n[2]; dv[2] = u[0] * n[1] - u[1] * n[0];
+        // Local y runs down the gauge face. The game's world is left-handed, so "down" is n x u.
+        dv[0] = n[1] * u[2] - n[2] * u[1]; dv[1] = n[2] * u[0] - n[0] * u[2]; dv[2] = n[0] * u[1] - n[1] * u[0];
         for (int i = 0; i < 3; i++) { g_xf.c[i] = c[i]; g_xf.u[i] = u[i] * s; g_xf.v[i] = dv[i] * s; }
         g_xf.on = true;
         if (k == 0)
@@ -1231,8 +1512,16 @@ static void DrawGauges(IDirect3DDevice9* dev, const HudData& d, float W, float H
             char sp[8]; sprintf(sp, "%d", d.speed);
             Gauge(dev, g_style[1], (float)d.speed, g.GaugeMaxSpeed, 20, 2, 1, 1e9f, sp);
         }
-        else
+        else if (k == 3)
             DrawRacePanel(d, 0, 0, 0.75f);
+        else
+        {
+            // Local units: 100 = GaugeSize. Corners clockwise from top left.
+            float hx = 100 * halfW / g.GaugeSize, hy = 100 * halfH / g.GaugeSize;
+            float xy[8] = { -hx, -hy, hx, -hy, hx, hy, -hx, hy };
+            float uv[8] = { area[0], area[1], area[2], area[1], area[2], area[3], area[0], area[3] };
+            TexQuad(xy, uv, g_lift.hud);
+        }
         g_xf.on = false;
     }
 }
@@ -1948,6 +2237,7 @@ static HRESULT STDMETHODCALLTYPE HkPresent(IDirect3DDevice9* dev, const RECT* a,
             }
         }
     }
+    LiftAtPresent(dev);
     DrawHud(dev);
     DrawDepthStereo(dev);
     bool shared = false;
@@ -1989,6 +2279,7 @@ static HRESULT STDMETHODCALLTYPE HkReset(IDirect3DDevice9* dev, D3DPRESENT_PARAM
 {
     ReleaseDepthStereo();
     ReleaseHoSrc();
+    ReleaseLift();
     return oReset(dev, pp);
 }
 
