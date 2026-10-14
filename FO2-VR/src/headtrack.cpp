@@ -117,10 +117,11 @@ struct Settings
     float GaugeDistance = 0.62f, GaugeDown = 0.30f, GaugeRight = 0.0f, GaugeSpacing = 0.20f, GaugeSize = 0.075f;
     float GaugeMaxRpm = 9000, GaugeRedline = 7500, GaugeMaxSpeed = 320;
     int Lift = 1;                    // move the game's own map and speedometer/nitro gauge onto the dashboard
-    float LiftMap[4] = { 0.00f, 0.35f, 0.26f, 1.00f };    // screen area of the game's map (x0, y0, x1, y1, 0..1)
-    float LiftBoost[4] = { 0.72f, 0.55f, 1.00f, 1.00f };  // screen area of the game's speedometer + nitro
-    float LiftScale = 1.0f;          // height of the lifted instruments relative to a gauge
-    int LiftSave = 1;                // save one race frame as FO2HeadTrack_hud.png (to set the areas)
+    float LiftMap[4] = { 0.040f, 0.450f, 0.260f, 0.810f };    // screen area of the game's map (x0, y0, x1, y1, 0..1)
+    float LiftBoost[4] = { 0.765f, 0.585f, 0.985f, 0.980f };  // screen area of the game's speedometer + nitro
+    float LiftScale = 1.0f;          // size of the lifted instruments relative to a gauge
+    int LiftReplace = 1;             // 1 = they take the places of the mod's rev counter and speedometer
+    int LiftSave = 0;                // save one race frame as FO2HeadTrack_hud.png (to set the areas)
 } g;
 
 static char g_iniPath[MAX_PATH];
@@ -206,6 +207,7 @@ static void LoadSettings()
     rect("MapArea", g.LiftMap);
     rect("BoostArea", g.LiftBoost);
     g.LiftScale = IniF("HUDLIFT", "Scale", g.LiftScale);
+    g.LiftReplace = IniI("HUDLIFT", "ReplaceGauges", g.LiftReplace);
     g.LiftSave = IniI("HUDLIFT", "SaveScreenshot", g.LiftSave);
     g.SeatRight = IniF("SEAT", "Right", g.SeatRight);
     g.SeatUp = IniF("SEAT", "Up", g.SeatUp);
@@ -1472,19 +1474,28 @@ static void DrawGauges(IDirect3DDevice9* dev, const HudData& d, float W, float H
     // Left to right: rev counter, speedometer; the race bar sits above the middle.
     // Slots 4 and 5: the game's own map (left of the rev counter) and speedometer/nitro gauge
     // (right of the speedometer), lifted out of the screen picture.
-    bool lift = LiftReady();
+    // With ReplaceGauges they take the rev counter's and speedometer's places instead.
+    bool lift = LiftReady(), replace = lift && g.LiftReplace;
     for (int k = 0; k < 6; k++)
     {
         if (k == 2) continue;  // slot of the UG2 version's minimap instrument (not ported)
         if (k == 3 && d.racers <= 0) continue;
         if (k >= 4 && !lift) continue;
+        if (k <= 1 && replace) continue;
         const float* area = k == 4 ? g.LiftMap : g.LiftBoost;
-        float halfH = g.GaugeSize * g.LiftScale, halfW = 0;
-        if (k >= 4) halfW = halfH * ((area[2] - area[0]) * W) / std::max(1.0f, (area[3] - area[1]) * H);
+        // The longer side of the area spans a gauge's diameter (times Scale).
+        float halfH = 0, halfW = 0;
+        if (k >= 4)
+        {
+            float aw = (area[2] - area[0]) * W, ah = std::max(1.0f, (area[3] - area[1]) * H);
+            float half = g.GaugeSize * g.LiftScale;
+            if (aw >= ah) { halfW = half; halfH = half * ah / aw; }
+            else { halfH = half; halfW = half * aw / ah; }
+        }
         float side, down = g.GaugeDown;
         side = g.GaugeRight + (k == 3 ? 0.0f : (k == 0 ? -0.5f : 0.5f) * g.GaugeSpacing);
-        if (k == 4) side = g.GaugeRight - 0.5f * g.GaugeSpacing - g.GaugeSize - 0.015f - halfW;
-        if (k == 5) side = g.GaugeRight + 0.5f * g.GaugeSpacing + g.GaugeSize + 0.015f + halfW;
+        if (k == 4) side = replace ? g.GaugeRight - 0.5f * g.GaugeSpacing : g.GaugeRight - 0.5f * g.GaugeSpacing - g.GaugeSize - 0.015f - halfW;
+        if (k == 5) side = replace ? g.GaugeRight + 0.5f * g.GaugeSpacing : g.GaugeRight + 0.5f * g.GaugeSpacing + g.GaugeSize + 0.015f + halfW;
         if (k == 3) down -= g.GaugeSize * 1.55f;
         float c[3], n[3], u[3], dv[3];
         for (int i = 0; i < 3; i++)
