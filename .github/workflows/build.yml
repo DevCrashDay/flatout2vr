@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: FO2HeadTrack.asi
+        working-directory: FO2-VR/src
+        run: cl /nologo /O2 /MT /EHsc /std:c++17 /W3 /D_CRT_SECURE_NO_WARNINGS /I..\..\third_party\openvr /I..\..\third_party\vulkan headtrack.cpp /LD /Fe:FO2HeadTrack.asi /link user32.lib
+      - name: FO2Telemetry.asi
+        working-directory: FO2-SimHub/src
+        run: cl /nologo /O2 /MT /EHsc /std:c++17 /W3 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS telemetry.cpp ffb.cpp /LD /Fe:FO2Telemetry.asi /link user32.lib
+      - name: FlatOut 2 Mod Settings.exe
+        working-directory: FO2-Settings
+        shell: cmd
+        run: |
+          set FW=C:\Windows\Microsoft.NET\Framework\v4.0.30319
+          csc /nologo /target:winexe /optimize+ /out:"FlatOut 2 Mod Settings.exe" /r:"%FW%\System.dll" /r:"%FW%\System.Core.dll" /r:"%FW%\System.Drawing.dll" /r:"%FW%\System.Windows.Forms.dll" SettingsApp.cs
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/scripts, dist/gauge_mod | Out-Null
+          Copy-Item FO2-VR/src/FO2HeadTrack.asi, FO2-VR/install/scripts/FO2HeadTrack.ini dist/scripts/
+          Copy-Item FO2-SimHub/src/FO2Telemetry.asi, FO2-SimHub/FO2Telemetry.ini, FO2-SimHub/FO2Telemetry.simdef dist/scripts/
+          Copy-Item FO2-VR/install/gauge_mod/* dist/gauge_mod/
+          Copy-Item FO2-VR/install/VR-HeadTracking.txt, FO2-VR/optional/dxvk.conf, "FO2-Settings/FlatOut 2 Mod Settings.exe" dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlatOut2-VR
+          path: dist
+      # The newest build of each branch is also kept as plain files on the branch "build/<branch>",
+      # so it can be fetched with git (no artifact download needed).
+      - name: Publish build branch
+        if: github.event_name == 'push'
+        shell: pwsh
+        working-directory: dist
+        run: |
+          git init -q
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Build of ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/build/${{ github.ref_name }}"
