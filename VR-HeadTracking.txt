@@ -1,0 +1,75 @@
+FlatOut 2 in VR (SteamVR, e.g. Pico 4 + Virtual Desktop)
+=========================================================
+
+What it is: scripts\FO2HeadTrack.asi (settings in scripts\FO2HeadTrack.ini, log in scripts\FO2HeadTrack.log).
+- Your headset's rotation and position move the in-game camera (6DoF), seated in the driver's seat.
+- Real 3D from the game's depth buffer, so both eyes update at the full game frame rate.
+- The picture is anchored where your head was when it was drawn, so turning your head feels like looking around.
+- Round rev counter and speedometer plus a position / lap / lap time bar, fixed on the dashboard in 3D.
+- The game's speed zoom (wider view at high speed) is switched off while driving; it feels wrong in VR.
+- The mouse cursor is hidden while driving.
+
+How to start
+1. Put on the headset, connect Virtual Desktop, and start SteamVR.
+2. Start FlatOut2.exe. (The mod never starts SteamVR itself; it connects once SteamVR runs.)
+3. In a race the camera sits in the driver's seat automatically, whichever in-game camera is selected.
+   Pick the bumper camera so the game does not draw your own car's body around you.
+4. Sit straight, look ahead and press F8 to recenter.
+
+Keys (while driving)
+  F7                         head tracking on/off
+  F8                         recenter
+  F9                         save seat + screen adjustments
+  F10                        SteamVR screen on/off
+  Ctrl + Left/Right          seat left/right
+  Ctrl + Up/Down             seat forward/back
+  Ctrl + PageUp/PageDown     seat up/down
+  Ctrl+Shift + Up/Down       screen bigger/smaller (fine-tunes the world scale)
+  Ctrl+Shift + Left/Right    screen closer/farther
+  Ctrl+Shift + PageUp/Down   screen higher/lower
+
+First drive: finding the seat
+- The seat position is measured from the middle of the car. FlatOut 2 cars differ a lot in size, so
+  adjust it with Ctrl + arrows / PageUp / PageDown until you sit where the driver sits, then press F9.
+
+HUD
+- Dashboard: rev counter (with gear) and speedometer, with the position / lap / lap time bar above them.
+  Position, size, max rpm, redline and max speed: [GAUGES] in the ini.
+  Their look comes from PNG files in the gauge_mod folder (see gauge_mod\README.txt to make your own).
+- With [GAUGES] Enabled=0 a flat speed + gear panel and the race bar are drawn on the screen instead.
+
+Stereo modes ([STEREO] Mode in the ini)
+- Mode=1 (default): every game frame is drawn once and split into a left and right view using the game's
+  depth buffer, so both eyes update at the full game rate. Each eye gets half the picture width, and edges
+  of near objects can smear a little.
+- Mode=0: the eyes take turns (left on one frame, right on the next): exact geometry and full width,
+  but each eye only gets half the game's frame rate.
+
+DXVK
+- Put DXVK's 32-bit d3d9.dll (from the x32 folder of a DXVK release) and dxvk.conf in the game folder.
+  Direct3D 9 then runs on Vulkan, and the finished frames go straight to SteamVR on the graphics card
+  (no desktop capture, works in the background, lower latency).
+- Without DXVK the mod falls back to capturing the game window from the desktop.
+- Undo DXVK: delete d3d9.dll and dxvk.conf.
+
+Smoothness
+- The game runs as a real SteamVR app: each eye's picture is handed to SteamVR together with the head
+  pose it was drawn with, and SteamVR keeps it steady between game frames (VRFrames=1 in the ini).
+- Turn off the game's motion blur and its own force feedback (if you use FO2Telemetry for the wheel).
+- More fps helps: an fps unlocker for FlatOut 2 works together with this mod.
+
+Tuning
+- If the world seems to slide when you turn your head, use Ctrl+Shift+Up/Down until it stays still, then F9.
+- Wider or narrower view: GameFOV in [STEREO]; the screen grows with it.
+- 3D too strong or too weak: DepthScale in [STEREO]. If the car body feels right in front of your eyes,
+  raise NearestDepth or move the seat (and use the bumper camera so the body is not drawn).
+- Menu screen too close or too big: Ctrl+Shift+Left/Right and Ctrl+Shift+Up/Down, or Distance/Width in [OVERLAY].
+- Without a headset the mod only applies the seat position (you can still drive from the cockpit on the monitor).
+
+If the game crashes or freezes
+- scripts\FO2HeadTrack.log then ends with a CRASH or FREEZE block that says where in the game it happened.
+  Please send that log together with scripts\FO2Telemetry.log.
+- [DEBUG] in the ini switches parts of the mod off one at a time (CameraHook, FieldOfView), and
+  [INPUT] Enabled=0 in FO2Telemetry.ini leaves the game's controls alone, to find the culprit.
+
+Undo: delete scripts\FO2HeadTrack.asi and scripts\FO2HeadTrack.ini.
